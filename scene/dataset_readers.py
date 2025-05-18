@@ -16,6 +16,9 @@ from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+from skimage.restoration import denoise_tv_chambolle
+from scipy.spatial.transform import Rotation as R
+from scipy.ndimage import gaussian_filter1d
 import numpy as np
 import json
 from pathlib import Path
@@ -44,6 +47,7 @@ class SceneInfo(NamedTuple):
     nerf_normalization: dict
     ply_path: str
     is_nerf_synthetic: bool
+    
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -70,6 +74,8 @@ def getNerfppNorm(cam_info):
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
     cam_infos = []
+    T_list = []
+    R_list = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -84,6 +90,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         uid = intr.id
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
+        #new_T = np.array([idx * 0.01, 0, 0])
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
@@ -110,9 +117,115 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
-                              image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                                  image_path=image_path, image_name=image_name, depth_path=depth_path,
+                                  width=width, height=height, is_test=False)
+        
+        #把cam_info添加到cam_infos
+        #cam_infos.append(cam_info)
         cam_infos.append(cam_info)
+
+        """ 原代码                         
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
+                                  image_path=image_path, image_name=image_name, depth_path=depth_path,
+                                  width=width, height=height, is_test=is_test)
+        """
+        
+    #排序    
+    cam_infos = sorted(cam_infos, key=lambda x: x.image_name)
+
+    """调试用
+    print("20th camerainfo before-------:",cam_infos[19])
+    print("40th camerainfo before------:",cam_infos[39])
+    """
+
+    """线性
+    first_T = cam_infos[0].T  # 获取第一个 CameraInfo 对象的 T 值
+    last_T = cam_infos[-1].T  # 获取最后一个 CameraInfo 对象的 T 值
+    n = len(cam_infos)
+    d = (last_T - first_T) / (n - 1)
+
+    print("first_T = ",first_T)
+    print("last_T = ",last_T)
+    print("项数为",n)
+    print("公差为",d)
+    
+    
+    for i in range(n):
+        new_T = first_T + i * d  # 计算新的 T 值
+        new_R = cam_infos[53].R #手动固定R值
+        print(new_T)
+        new_cam_info = cam_infos[i]._replace(T=new_T, R=new_R, is_test=True )  # 使用 _replace 创建新实例
+        cam_infos.append(new_cam_info) 
+    """
+    """
+    # 应用总变分正则化平滑/TV
+    T_smoothed = np.zeros_like(T_array)
+    for i in range(3):  # 对 x, y, z 逐维处理
+        T_smoothed[:, i] = denoise_tv_chambolle(T_array[:, i], weight=50)
+    #print(T_smoothed)
+       
+    t_splits = [T_smoothed[i, :].reshape(1, 3) for i in range(T_smoothed.shape[0])]
+    """
+
+   
+    n = len(cam_infos)
+    for i in range(n):
+      T_list.append(cam_infos[i].T)
+      R_list.append(cam_infos[i].R)
+
+
+    # 将列表转换为 Nx3 的数组
+    T_array = np.vstack(T_list)  # 将列表转换为 NumPy 数组 (N, 3)
+    #print(T_array)
+    R_array = np.stack(R_list, axis=0)  # 变成 (N, 3, 3)
+    print("Fixed R_array shape:", R_array.shape)  # 应该输出 (930, 3, 3)
+
+
+# 设置高斯滤波参数
+    sigma = 2  # 控制平滑程度（数值越大越平滑）
+
+# 对 T 进行高斯滤波
+    T_smooth_gaussian = gaussian_filter1d(T_array, sigma=sigma, axis=0)
+
+# 对 R 进行高斯滤波
+    R_smooth_gaussian = np.zeros_like(R_array)
+    for i in range(3):
+        for j in range(3):
+            R_smooth_gaussian[:, i, j] = gaussian_filter1d(R_array[:, i, j], sigma=sigma)
+
+# 旋转矩阵正交化
+    R_smooth_gaussian_orthogonalized = np.zeros_like(R_smooth_gaussian)
+    for i in range(R_smooth_gaussian.shape[0]):
+        U, _, Vt = np.linalg.svd(R_smooth_gaussian[i])
+        R_smooth_gaussian_orthogonalized[i] = np.dot(U, Vt)
+
+    for i in range(n):
+        new_cam_info = cam_infos[i]._replace(T = T_smooth_gaussian[i], R = R_smooth_gaussian_orthogonalized[i], is_test=True )  # 使用 _replace 创建新实例
+        
+        #print("T_before:",cam_infos[i].T)
+        #print("T_after",new_cam_info.T)
+        #print("R_before",cam_infos[i].R)
+        #print("R_after",new_cam_info.R)
+        
+        #print(new_cam_info)
+        cam_infos.append(new_cam_info)
+        #print("after",new_cam_info.T)
+        
+
+    
+        
+    #print(cam_info)
+    #print(new_cam_info)
+    #print(cam_infos)
+    
+
+    """调试用
+    print("20th camerainfo after-------:",cam_infos[19])
+    print("40th camerainfo after-------:",cam_infos[39])   
+    print(cam_info)
+    """  
+
+    print("cam_infos里有多少个CameraInfo元素",len(cam_infos)) 
 
     sys.stdout.write('\n')
     return cam_infos
@@ -176,6 +289,10 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             print(f"An unexpected error occurred when trying to open depth_params.json file: {e}")
             sys.exit(1)
 
+    cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
+    cam_names = sorted(cam_names)
+    test_cam_names_list = cam_names
+  
     if eval:
         if "360" in path:
             llffhold = 8
@@ -183,22 +300,40 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             print("------------LLFF HOLD-------------")
             cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
             cam_names = sorted(cam_names)
-            test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
+            test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]           
         else:
             with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
                 test_cam_names_list = [line.strip() for line in file]
     else:
         test_cam_names_list = []
 
+
+    #print(test_cam_names_list)
+
     reading_dir = "images" if images == None else images
+    """
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
         depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    """
+    cam_infos = readColmapCameras(
+        cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
+        images_folder=os.path.join(path, reading_dir), 
+        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
+    #train_cam_infos = [c for c in cam_infos if not c.is_test]
+    #print(train_cam_infos)
     test_cam_infos = [c for c in cam_infos if c.is_test]
+    #test_cam_infos = [c for c in cam_infos]
+                    
+    #print("----------------test_cam_infos",test_cam_infos)
+    #print("-------------------train_cam_infos",train_cam_infos)
+    #print("-----------------cam_infos",cam_infos)
+    #print("---------------cam_infos_unsorted",cam_infos_unsorted)
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -233,9 +368,10 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
         fovx = contents["camera_angle_x"]
 
         frames = contents["frames"]
+        
         for idx, frame in enumerate(frames):
             cam_name = os.path.join(path, frame["file_path"] + extension)
-
+            
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
@@ -246,6 +382,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
+            
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
